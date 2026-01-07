@@ -62,5 +62,7 @@ export default {
   mergeRequests: {
     logFile: './merge-requests.json',
     log: false,
+    resetTargetBranchPerMr: false,
+    replayMergedRequests: false,
   },
 } as Settings;

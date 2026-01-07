@@ -938,25 +938,64 @@ export class GithubHelper {
   async createPullRequestAndComments(
     mergeRequest: GitLabMergeRequest
   ): Promise<void> {
-    let pullRequestData = await this.createPullRequest(mergeRequest);
+    const replayMerged =
+      settings.mergeRequests.replayMergedRequests &&
+      mergeRequest.state === 'merged';
+    let restoreTargetBranch: null | (() => Promise<void>) = null;
+    let tempBranchName: string | null = null;
+    let tempBranchCreated = false;
+    const originalSourceBranch = mergeRequest.source_branch;
 
-    // createPullRequest() returns an issue number if a PR could not be created and
-    // an issue was created instead, and settings.useIssueImportAPI is true. In that
-    // case comments were already added and the state is already properly set
-    if (typeof pullRequestData === 'number' || !pullRequestData) return;
+    if (replayMerged) {
+      await this.resetTargetBranchForMergeRequest(mergeRequest, false);
+      const tempBranch = await this.ensureTempBranchForMergeRequest(
+        mergeRequest
+      );
+      if (tempBranch) {
+        tempBranchName = tempBranch.name;
+        tempBranchCreated = tempBranch.created;
+        mergeRequest.source_branch = tempBranchName;
+      }
+    } else if (settings.mergeRequests.resetTargetBranchPerMr) {
+      restoreTargetBranch =
+        await this.resetTargetBranchForMergeRequest(mergeRequest, true);
+    }
 
-    let pullRequest = pullRequestData.data;
+    try {
+      let pullRequestData = await this.createPullRequest(mergeRequest);
 
-    // data is set to null if one of the branches does not exist and the pull request cannot be created
-    if (pullRequest) {
-      // Add milestones, labels, and other attributes from the Issues API
-      await this.updatePullRequestData(pullRequest, mergeRequest);
+      // createPullRequest() returns an issue number if a PR could not be created and
+      // an issue was created instead, and settings.useIssueImportAPI is true. In that
+      // case comments were already added and the state is already properly set
+      if (typeof pullRequestData === 'number' || !pullRequestData) return;
 
-      // add any comments/nodes associated with this pull request
-      await this.createPullRequestComments(pullRequest, mergeRequest);
+      let pullRequest = pullRequestData.data;
 
-      // Make sure to close the GitHub pull request if it is closed or merged in GitLab
-      await this.updatePullRequestState(pullRequest, mergeRequest);
+      // data is set to null if one of the branches does not exist and the pull request cannot be created
+      if (pullRequest) {
+        // Add milestones, labels, and other attributes from the Issues API
+        await this.updatePullRequestData(pullRequest, mergeRequest);
+
+        // add any comments/nodes associated with this pull request
+        await this.createPullRequestComments(pullRequest, mergeRequest);
+
+        if (replayMerged) {
+          await this.mergePullRequest(pullRequest, mergeRequest);
+        } else {
+          // Make sure to close the GitHub pull request if it is closed or merged in GitLab
+          await this.updatePullRequestState(pullRequest, mergeRequest);
+        }
+      }
+    } finally {
+      if (restoreTargetBranch) {
+        await restoreTargetBranch();
+      }
+      if (tempBranchName) {
+        mergeRequest.source_branch = originalSourceBranch;
+        if (tempBranchCreated) {
+          await this.deleteTempBranch(tempBranchName, mergeRequest);
+        }
+      }
     }
   }
 
@@ -1121,6 +1160,154 @@ export class GithubHelper {
 
       return this.githubApi.issues.create(props);
     }
+  }
+
+  private async getMergeRequestBaseSha(
+    mergeRequest: GitLabMergeRequest
+  ): Promise<string | null> {
+    const baseSha = (mergeRequest as any).diff_refs?.base_sha;
+    if (baseSha) return baseSha;
+    if (!mergeRequest.iid) return null;
+
+    const detailed = await this.gitlabHelper.getMergeRequest(mergeRequest.iid);
+    return (detailed as any)?.diff_refs?.base_sha ?? null;
+  }
+
+  private async getMergeRequestHeadSha(
+    mergeRequest: GitLabMergeRequest
+  ): Promise<string | null> {
+    const headSha = (mergeRequest as any).diff_refs?.head_sha ?? mergeRequest.sha;
+    if (headSha) return headSha;
+    if (!mergeRequest.iid) return null;
+
+    const detailed = await this.gitlabHelper.getMergeRequest(mergeRequest.iid);
+    return (detailed as any)?.diff_refs?.head_sha ?? null;
+  }
+
+  private async ensureTempBranchForMergeRequest(
+    mergeRequest: GitLabMergeRequest
+  ): Promise<null | { name: string; created: boolean }> {
+    if (!mergeRequest.iid) return null;
+    const headSha = await this.getMergeRequestHeadSha(mergeRequest);
+    if (!headSha) return null;
+
+    const name = `gl-mr-${mergeRequest.iid}`;
+
+    try {
+      await this.githubApi.git.createRef({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref: `refs/heads/${name}`,
+        sha: headSha,
+      });
+      return { name, created: true };
+    } catch (err) {
+      if ((err as any).status !== 422) throw err;
+    }
+
+    await this.githubApi.git.updateRef({
+      owner: this.githubOwner,
+      repo: this.githubRepo,
+      ref: `heads/${name}`,
+      sha: headSha,
+      force: true,
+    });
+    return { name, created: true };
+  }
+
+  private async deleteTempBranch(
+    branchName: string,
+    mergeRequest: GitLabMergeRequest
+  ): Promise<void> {
+    try {
+      await this.githubApi.git.deleteRef({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref: `heads/${branchName}`,
+      });
+    } catch (err) {
+      console.error(
+        `\tFailed to delete temp branch '${branchName}' for MR !${mergeRequest.iid}`
+      );
+      console.error(err);
+    }
+  }
+
+  private async mergePullRequest(
+    pullRequest: Pick<GitHubPullRequest, 'number' | 'state'>,
+    mergeRequest: GitLabMergeRequest
+  ): Promise<void> {
+    if (settings.dryRun) return;
+    if (pullRequest.state === 'closed') return;
+
+    await utils.sleep(this.delayInMs);
+
+    try {
+      await this.githubApi.pulls.merge({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        pull_number: pullRequest.number,
+        merge_method: 'merge',
+      });
+    } catch (err) {
+      console.error(
+        `\tFailed to merge PR for MR !${mergeRequest.iid} (PR #${pullRequest.number}).`
+      );
+      throw err;
+    }
+  }
+
+  private async resetTargetBranchForMergeRequest(
+    mergeRequest: GitLabMergeRequest,
+    restore: boolean
+  ): Promise<null | (() => Promise<void>)> {
+    if (settings.dryRun) return null;
+    const targetBranch = mergeRequest.target_branch;
+    const baseSha = await this.getMergeRequestBaseSha(mergeRequest);
+
+    if (!targetBranch || !baseSha) {
+      console.log(
+        `\tSkipping target branch reset for MR !${mergeRequest.iid} (missing target branch or base sha).`
+      );
+      return null;
+    }
+
+    const currentBranch = await this.githubApi.repos.getBranch({
+      owner: this.githubOwner,
+      repo: this.githubRepo,
+      branch: targetBranch,
+    });
+    const currentSha = currentBranch.data.commit.sha;
+
+    if (currentSha === baseSha) return null;
+
+    console.log(
+      `\tResetting '${targetBranch}' to ${baseSha} for MR !${mergeRequest.iid}`
+    );
+    await utils.sleep(this.delayInMs);
+    await this.githubApi.git.updateRef({
+      owner: this.githubOwner,
+      repo: this.githubRepo,
+      ref: `heads/${targetBranch}`,
+      sha: baseSha,
+      force: true,
+    });
+
+    if (!restore) return null;
+
+    return async () => {
+      console.log(
+        `\tRestoring '${targetBranch}' to ${currentSha} after MR !${mergeRequest.iid}`
+      );
+      await utils.sleep(this.delayInMs);
+      await this.githubApi.git.updateRef({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref: `heads/${targetBranch}`,
+        sha: currentSha,
+        force: true,
+      });
+    };
   }
 
   // ----------------------------------------------------------------------------

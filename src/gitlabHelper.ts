@@ -116,6 +116,25 @@ export class GitlabHelper {
   }
 
   /**
+   * Gets a merge request by IID to access detailed fields (e.g. diff_refs).
+   */
+  async getMergeRequest(
+    mergeRequestIid: number
+  ): Promise<GitLabMergeRequest | null> {
+    try {
+      return await this.gitlabApi.MergeRequests.show(
+        this.gitlabProjectId,
+        mergeRequestIid
+      );
+    } catch (err) {
+      console.error(
+        `Could not fetch GitLab merge request !${mergeRequestIid}.`
+      );
+      return null;
+    }
+  }
+
+  /**
    * Gets attachment using http get
    */
   async getAttachment(relurl: string) {

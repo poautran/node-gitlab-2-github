@@ -33,6 +33,8 @@ export default interface Settings {
   mergeRequests: {
     logFile: string;
     log: boolean;
+    resetTargetBranchPerMr?: boolean;
+    replayMergedRequests?: boolean;
   };
   commitMap?: {
     [key: string]: string;

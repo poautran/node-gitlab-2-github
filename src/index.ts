@@ -538,8 +538,18 @@ async function transferMergeRequests() {
     labels: settings.filterByLabel,
   });
 
-  // Sort merge requests in ascending order of their number (by iid)
-  mergeRequests = mergeRequests.sort((a, b) => a.iid - b.iid);
+  // Sort merge requests in ascending order of their number (by iid), unless
+  // we are replaying merged requests in chronological merge order.
+  if (settings.mergeRequests.replayMergedRequests) {
+    mergeRequests = mergeRequests.sort((a, b) => {
+      const aMerged = a.merged_at ? new Date(a.merged_at).getTime() : 0;
+      const bMerged = b.merged_at ? new Date(b.merged_at).getTime() : 0;
+      if (aMerged !== bMerged) return aMerged - bMerged;
+      return a.iid - b.iid;
+    });
+  } else {
+    mergeRequests = mergeRequests.sort((a, b) => a.iid - b.iid);
+  }
 
   // Get a list of the current pull requests in the new GitHub repo (likely to
   // be empty)
