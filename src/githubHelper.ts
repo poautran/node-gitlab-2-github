@@ -1790,6 +1790,11 @@ export class GithubHelper {
       settings.projectmap !== null &&
       Object.keys(settings.projectmap).length > 0;
 
+    str = str.replace(
+      /\[Compare with previous version\]\([^)]+\)/g,
+      'Compare with previous version (link unavailable after force-push)'
+    );
+
     if (add_line) str = GithubHelper.addMigrationLine(str, item, repoLink, add_line_ref);
     let reString = '';
 
@@ -2048,7 +2053,7 @@ export class GithubHelper {
       ref = head_sha;
     }
 
-    let lineRef = `Commented on [${ref}](${repoLink}/compare/${base_sha}..${head_sha}${slug})\n\n`;
+    let lineRef = `Commented on [${ref}](${repoLink}/compare/${base_sha}...${head_sha}${slug})\n\n`;
 
     if (position.line_range) {
       if (position.line_range.start.type === 'new') {
