@@ -1316,7 +1316,10 @@ export class GithubHelper {
    * Creates the information required for a new review comment.
    * See: https://docs.github.com/en/rest/pulls/comments?apiVersion=2022-11-28#create-a-review-comment-for-a-pull-request
    */
-  static createReviewCommentInformation(position, repoLink: string): object {
+  static createReviewCommentInformation(
+    position,
+    repoLink: string
+  ): object | null {
     if (
       !repoLink ||
       !repoLink.startsWith(gitHubLocation) ||
@@ -1324,7 +1327,7 @@ export class GithubHelper {
       !position.head_sha ||
       !position.line_range
     ) {
-      throw new Error(`Position is invalid: ${JSON.stringify(position)}`);
+      return null;
     }
 
     let head_sha = position.head_sha;
@@ -1430,10 +1433,20 @@ export class GithubHelper {
           }
 
           if (note.type === 'DiffNote') {
-            reviewComments.push({
-              body: await this.convertIssuesAndComments(note.body, note, true, false),
-              ...GithubHelper.createReviewCommentInformation(note.position, repoLink),
-            });
+            const reviewInfo = GithubHelper.createReviewCommentInformation(
+              note.position,
+              repoLink
+            );
+            if (reviewInfo) {
+              reviewComments.push({
+                body: await this.convertIssuesAndComments(note.body, note, true, false),
+                ...reviewInfo,
+              });
+            } else {
+              console.log(
+                '\tSkipping invalid diff position for review comment, falling back to regular comment.'
+              );
+            }
           } 
           
           // create regular comment either way, in case the review comment cannot be created
