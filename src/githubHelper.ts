@@ -972,11 +972,17 @@ export class GithubHelper {
         // Add milestones, labels, and other attributes from the Issues API
         await this.updatePullRequestData(pullRequest, mergeRequest);
 
+        // Request reviewers and add approvals info (best-effort).
+        await this.requestReviewersAndApprovers(pullRequest, mergeRequest);
+
         // add any comments/nodes associated with this pull request
         await this.createPullRequestComments(pullRequest, mergeRequest);
 
         if (replayMerged) {
-          await this.mergePullRequest(pullRequest, mergeRequest);
+          await this.closePullRequestWithGitlabMergeInfo(
+            pullRequest,
+            mergeRequest
+          );
         } else {
           // Make sure to close the GitHub pull request if it is closed or merged in GitLab
           await this.updatePullRequestState(pullRequest, mergeRequest);
@@ -989,6 +995,78 @@ export class GithubHelper {
           await this.deleteTempBranch(tempBranchName, mergeRequest);
         }
       }
+    }
+  }
+
+  private convertReviewers(mergeRequest: GitLabMergeRequest): string[] {
+    if (!mergeRequest.reviewers) return [];
+    let reviewers: string[] = [];
+    for (let reviewer of mergeRequest.reviewers) {
+      let username: string = reviewer.username as string;
+      this.users.add(username);
+      if (username === settings.github.username) {
+        reviewers.push(settings.github.username);
+      } else if (settings.usermap && settings.usermap[username]) {
+        let gitHubUsername = settings.usermap[username];
+        if (!this.githubOwnerIsOrg || this.members.has(gitHubUsername)) {
+          reviewers.push(gitHubUsername);
+        } else {
+          console.log(
+            `Cannot request reviewer: User ${gitHubUsername} is not a member of ${this.githubOwner}`
+          );
+        }
+      }
+    }
+
+    return reviewers;
+  }
+
+  private async requestReviewersAndApprovers(
+    pullRequest: Pick<GitHubPullRequest, 'number'>,
+    mergeRequest: GitLabMergeRequest
+  ): Promise<void> {
+    if (settings.dryRun) return;
+
+    const reviewers = this.convertReviewers(mergeRequest);
+    const approvals = await this.gitlabHelper.getMergeRequestApprovals(
+      mergeRequest.iid
+    );
+    const mappedApprovals = approvals
+      .map(u => (settings.usermap && settings.usermap[u] ? settings.usermap[u] : u))
+      .filter(u => u);
+
+    if (reviewers.length > 0) {
+      await utils.sleep(this.delayInMs);
+      await this.githubApi.pulls
+        .requestReviewers({
+          owner: this.githubOwner,
+          repo: this.githubRepo,
+          pull_number: pullRequest.number,
+          reviewers: Array.from(new Set(reviewers)),
+        })
+        .catch(err => {
+          console.error('could not request GitHub reviewers!');
+          console.error(err);
+        });
+    }
+
+    if (mappedApprovals.length > 0) {
+      await utils.sleep(this.delayInMs);
+      const body = utils.organizationUsersString(
+        Array.from(new Set(mappedApprovals)),
+        'Approved by'
+      );
+      await this.githubApi.issues
+        .createComment({
+          owner: this.githubOwner,
+          repo: this.githubRepo,
+          issue_number: pullRequest.number,
+          body: body.trim(),
+        })
+        .catch(err => {
+          console.error('could not create GitHub approvals comment!');
+          console.error(err);
+        });
     }
   }
 
@@ -1177,6 +1255,17 @@ export class GithubHelper {
     return (detailed as any)?.diff_refs?.head_sha ?? null;
   }
 
+  private async getMergeRequestMergeCommitSha(
+    mergeRequest: GitLabMergeRequest
+  ): Promise<string | null> {
+    const mergeSha = (mergeRequest as any).merge_commit_sha;
+    if (mergeSha) return mergeSha;
+    if (!mergeRequest.iid) return null;
+
+    const detailed = await this.gitlabHelper.getMergeRequest(mergeRequest.iid);
+    return (detailed as any)?.merge_commit_sha ?? null;
+  }
+
   private async ensureTempBranchForMergeRequest(
     mergeRequest: GitLabMergeRequest
   ): Promise<null | { name: string; created: boolean }> {
@@ -1226,28 +1315,60 @@ export class GithubHelper {
     }
   }
 
-  private async mergePullRequest(
+  private async closePullRequestWithGitlabMergeInfo(
     pullRequest: Pick<GitHubPullRequest, 'number' | 'state'>,
     mergeRequest: GitLabMergeRequest
   ): Promise<void> {
     if (settings.dryRun) return;
     if (pullRequest.state === 'closed') return;
 
-    await utils.sleep(this.delayInMs);
+    const mergeSha = await this.getMergeRequestMergeCommitSha(mergeRequest);
+    const targetBranch = mergeRequest.target_branch;
 
-    try {
-      await this.githubApi.pulls.merge({
+    if (mergeSha && targetBranch) {
+      await utils.sleep(this.delayInMs);
+      await this.githubApi.git.updateRef({
         owner: this.githubOwner,
         repo: this.githubRepo,
-        pull_number: pullRequest.number,
-        merge_method: 'merge',
+        ref: `heads/${targetBranch}`,
+        sha: mergeSha,
+        force: true,
       });
-    } catch (err) {
-      console.error(
-        `\tFailed to merge PR for MR !${mergeRequest.iid} (PR #${pullRequest.number}).`
-      );
-      throw err;
     }
+
+    await utils.sleep(this.delayInMs);
+    await this.githubApi.issues.update({
+      owner: this.githubOwner,
+      repo: this.githubRepo,
+      issue_number: pullRequest.number,
+      state: 'closed',
+    });
+
+    const mergedBy = (mergeRequest as any).merged_by?.username;
+    const mergedAt = (mergeRequest as any).merged_at;
+    const mappedMerger =
+      mergedBy && settings.usermap && settings.usermap[mergedBy]
+        ? settings.usermap[mergedBy]
+        : mergedBy;
+
+    let info = 'Merged in GitLab.';
+    if (mappedMerger) {
+      info += ` Merged by @${mappedMerger}`;
+    }
+    if (mergedAt) {
+      info += ` on ${mergedAt}.`;
+    }
+    if (mergeSha) {
+      info += ` Merge commit: ${mergeSha}.`;
+    }
+
+    await utils.sleep(this.delayInMs);
+    await this.githubApi.issues.createComment({
+      owner: this.githubOwner,
+      repo: this.githubRepo,
+      issue_number: pullRequest.number,
+      body: info,
+    });
   }
 
   private async resetTargetBranchForMergeRequest(
