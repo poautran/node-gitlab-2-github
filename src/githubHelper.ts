@@ -941,7 +941,6 @@ export class GithubHelper {
     const replayMerged =
       settings.mergeRequests.replayMergedRequests &&
       mergeRequest.state === 'merged';
-    let restoreTargetBranch: null | (() => Promise<void>) = null;
     let tempBranchName: string | null = null;
     let tempBranchCreated = false;
     const originalSourceBranch = mergeRequest.source_branch;
@@ -956,9 +955,6 @@ export class GithubHelper {
         tempBranchCreated = tempBranch.created;
         mergeRequest.source_branch = tempBranchName;
       }
-    } else if (settings.mergeRequests.resetTargetBranchPerMr) {
-      restoreTargetBranch =
-        await this.resetTargetBranchForMergeRequest(mergeRequest, true);
     }
 
     try {
@@ -987,9 +983,6 @@ export class GithubHelper {
         }
       }
     } finally {
-      if (restoreTargetBranch) {
-        await restoreTargetBranch();
-      }
       if (tempBranchName) {
         mergeRequest.source_branch = originalSourceBranch;
         if (tempBranchCreated) {
