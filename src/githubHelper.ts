@@ -955,6 +955,29 @@ export class GithubHelper {
         tempBranchCreated = tempBranch.created;
         mergeRequest.source_branch = tempBranchName;
       }
+    } else if (mergeRequest.source_branch) {
+      // If the source branch no longer exists on GitHub, try a temp branch from GitLab SHA.
+      try {
+        await this.githubApi.repos.getBranch({
+          owner: this.githubOwner,
+          repo: this.githubRepo,
+          branch: mergeRequest.source_branch,
+        });
+      } catch (err) {
+        const status = (err as any).status;
+        if (status === 404) {
+          const tempBranch = await this.ensureTempBranchForMergeRequest(
+            mergeRequest
+          );
+          if (tempBranch) {
+            tempBranchName = tempBranch.name;
+            tempBranchCreated = tempBranch.created;
+            mergeRequest.source_branch = tempBranchName;
+          }
+        } else {
+          throw err;
+        }
+      }
     }
 
     try {
@@ -1266,6 +1289,66 @@ export class GithubHelper {
     return (detailed as any)?.merge_commit_sha ?? null;
   }
 
+  private async githubHasCommit(sha: string): Promise<boolean> {
+    try {
+      await this.githubApi.repos.getCommit({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref: sha,
+      });
+      return true;
+    } catch (err) {
+      const status = (err as any).status;
+      if (status === 404 || status === 422) return false;
+      throw err;
+    }
+  }
+
+  private refsWriteDisabled = false;
+  private refsWriteDisabledNotified = false;
+
+  private noteRefsWriteDisabled(): void {
+    if (this.refsWriteDisabledNotified) return;
+    this.refsWriteDisabledNotified = true;
+    console.log(
+      `\tDisabling Git ref updates for this run (received 404/403 from GitHub refs API).`
+    );
+  }
+
+  private async safeUpdateRef(
+    ref: string,
+    sha: string,
+    context: string
+  ): Promise<boolean> {
+    if (this.refsWriteDisabled) {
+      console.log(
+        `\tSkipping ${context}: ref updates are disabled for this run.`
+      );
+      return false;
+    }
+    try {
+      await this.githubApi.git.updateRef({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref,
+        sha,
+        force: true,
+      });
+      return true;
+    } catch (err) {
+      const status = (err as any).status;
+      if (status === 404 || status === 403) {
+        this.refsWriteDisabled = true;
+        this.noteRefsWriteDisabled();
+        console.log(
+          `\tSkipping ${context}: cannot update '${ref}' (${status}).`
+        );
+        return false;
+      }
+      throw err;
+    }
+  }
+
   private async ensureTempBranchForMergeRequest(
     mergeRequest: GitLabMergeRequest
   ): Promise<null | { name: string; created: boolean }> {
@@ -1274,26 +1357,52 @@ export class GithubHelper {
     if (!headSha) return null;
 
     const name = `gl-mr-${mergeRequest.iid}`;
+    let branchSha = headSha;
+    const hasHeadSha = await this.githubHasCommit(headSha);
+    if (!hasHeadSha) {
+      const mergeSha = await this.getMergeRequestMergeCommitSha(mergeRequest);
+      if (mergeSha && (await this.githubHasCommit(mergeSha))) {
+        branchSha = mergeSha;
+        console.log(
+          `\tHead commit ${headSha} for MR !${mergeRequest.iid} is missing on GitHub; using merge commit ${mergeSha} for temp branch '${name}'.`
+        );
+      } else {
+        console.log(
+          `\tSkipping temp branch '${name}' for MR !${mergeRequest.iid}: neither head commit ${headSha} nor merge commit ${mergeSha ?? '<none>'} exists on GitHub.`
+        );
+        return null;
+      }
+    }
 
+    if (this.refsWriteDisabled) {
+      console.log(
+        `\tSkipping temp branch '${name}' for MR !${mergeRequest.iid}: ref updates are disabled for this run.`
+      );
+      return null;
+    }
     try {
       await this.githubApi.git.createRef({
         owner: this.githubOwner,
         repo: this.githubRepo,
         ref: `refs/heads/${name}`,
-        sha: headSha,
+        sha: branchSha,
       });
       return { name, created: true };
     } catch (err) {
-      if ((err as any).status !== 422) throw err;
+      const status = (err as any).status;
+      const message = (err as any)?.response?.data?.message;
+      if (status === 404 || status === 403) {
+        this.refsWriteDisabled = true;
+        this.noteRefsWriteDisabled();
+        console.log(
+          `\tSkipping temp branch '${name}' for MR !${mergeRequest.iid}: cannot create ref (status ${status}).`
+        );
+        return null;
+      }
+      if (status !== 422 || message !== 'Reference already exists') throw err;
     }
 
-    await this.githubApi.git.updateRef({
-      owner: this.githubOwner,
-      repo: this.githubRepo,
-      ref: `heads/${name}`,
-      sha: headSha,
-      force: true,
-    });
+    await this.safeUpdateRef(`heads/${name}`, branchSha, `temp branch '${name}'`);
     return { name, created: true };
   }
 
@@ -1326,14 +1435,18 @@ export class GithubHelper {
     const targetBranch = mergeRequest.target_branch;
 
     if (mergeSha && targetBranch) {
-      await utils.sleep(this.delayInMs);
-      await this.githubApi.git.updateRef({
-        owner: this.githubOwner,
-        repo: this.githubRepo,
-        ref: `heads/${targetBranch}`,
-        sha: mergeSha,
-        force: true,
-      });
+      if (await this.githubHasCommit(mergeSha)) {
+        await utils.sleep(this.delayInMs);
+        await this.safeUpdateRef(
+          `heads/${targetBranch}`,
+          mergeSha,
+          `merge commit update for MR !${mergeRequest.iid}`
+        );
+      } else {
+        console.log(
+          `\tSkipping '${targetBranch}' update for MR !${mergeRequest.iid}: merge commit ${mergeSha} does not exist on GitHub.`
+        );
+      }
     }
 
     await utils.sleep(this.delayInMs);
@@ -1386,41 +1499,56 @@ export class GithubHelper {
       return null;
     }
 
-    const currentBranch = await this.githubApi.repos.getBranch({
-      owner: this.githubOwner,
-      repo: this.githubRepo,
-      branch: targetBranch,
-    });
+    let currentBranch;
+    try {
+      currentBranch = await this.githubApi.repos.getBranch({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        branch: targetBranch,
+      });
+    } catch (err) {
+      const status = (err as any).status;
+      if (status === 404) {
+        console.log(
+          `\tSkipping reset of '${targetBranch}' for MR !${mergeRequest.iid}: target branch does not exist on GitHub.`
+        );
+        return null;
+      }
+      throw err;
+    }
     const currentSha = currentBranch.data.commit.sha;
 
     if (currentSha === baseSha) return null;
+
+    if (!(await this.githubHasCommit(baseSha))) {
+      console.log(
+        `\tSkipping reset of '${targetBranch}' for MR !${mergeRequest.iid}: base commit ${baseSha} does not exist on GitHub.`
+      );
+      return null;
+    }
 
     console.log(
       `\tResetting '${targetBranch}' to ${baseSha} for MR !${mergeRequest.iid}`
     );
     await utils.sleep(this.delayInMs);
-    await this.githubApi.git.updateRef({
-      owner: this.githubOwner,
-      repo: this.githubRepo,
-      ref: `heads/${targetBranch}`,
-      sha: baseSha,
-      force: true,
-    });
+    const resetOk = await this.safeUpdateRef(
+      `heads/${targetBranch}`,
+      baseSha,
+      `reset of '${targetBranch}' for MR !${mergeRequest.iid}`
+    );
 
-    if (!restore) return null;
+    if (!restore || !resetOk) return null;
 
     return async () => {
       console.log(
         `\tRestoring '${targetBranch}' to ${currentSha} after MR !${mergeRequest.iid}`
       );
       await utils.sleep(this.delayInMs);
-      await this.githubApi.git.updateRef({
-        owner: this.githubOwner,
-        repo: this.githubRepo,
-        ref: `heads/${targetBranch}`,
-        sha: currentSha,
-        force: true,
-      });
+      await this.safeUpdateRef(
+        `heads/${targetBranch}`,
+        currentSha,
+        `restore of '${targetBranch}' for MR !${mergeRequest.iid}`
+      );
     };
   }
 
@@ -1586,16 +1714,17 @@ export class GithubHelper {
               ...first_comment,
             }).catch(x => {
               let use_fallback = false;
-              if (x.status === 422) {
-                if (x.response.data.message === 'Validation Failed') {
-                  let validation_error = x.response.data.errors[0];
-                  if (validation_error.message.endsWith(' is not part of the pull request')) {
-                    // fall back to creating a regular comment for the discussion
-                    create_regular_comment = true;
-                    use_fallback = true;
-                    console.log('fallback to regular comment');
-                  }
-                }
+              if (x.status === 422 || x.status === 404) {
+                // fall back to creating a regular comment for the discussion
+                create_regular_comment = true;
+                use_fallback = true;
+                const message = x.response?.data?.message;
+                const validation_error = x.response?.data?.errors?.[0]?.message;
+                console.log(
+                  `fallback to regular comment (review comment failed: ${message ?? 'unknown'}${
+                    validation_error ? ` - ${validation_error}` : ''
+                  })`
+                );
               }
 
               if (!use_fallback) {
@@ -1770,7 +1899,7 @@ export class GithubHelper {
    * @param add_issue_information Set to true to add assignees, reviewers, and approvers
    */
   async convertIssuesAndComments(
-    str: string,
+    str: string | null | undefined,
     item: GitLabIssue | GitLabMergeRequest | GitLabNote | MilestoneImport | GitLabDiscussionNote,
     add_line: boolean = true,
     add_line_ref: boolean = true,
@@ -1784,6 +1913,8 @@ export class GithubHelper {
     // before the #, and we do the same for MRs, labels and milestones.
 
     const repoLink = `${this.githubUrl}/${this.githubOwner}/${this.githubRepo}`;
+    // Normalize empty/nullable bodies to avoid null.replace crashes.
+    str = str ?? '';
     const hasUsermap =
       settings.usermap !== null && Object.keys(settings.usermap).length > 0;
     const hasProjectmap =
