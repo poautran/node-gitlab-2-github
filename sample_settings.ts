@@ -62,5 +62,6 @@ export default {
   mergeRequests: {
     logFile: './merge-requests.json',
     log: false,
+    replayMergedRequests: false,
   },
 } as Settings;

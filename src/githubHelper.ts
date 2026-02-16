@@ -938,25 +938,158 @@ export class GithubHelper {
   async createPullRequestAndComments(
     mergeRequest: GitLabMergeRequest
   ): Promise<void> {
-    let pullRequestData = await this.createPullRequest(mergeRequest);
+    const replayMerged =
+      settings.mergeRequests.replayMergedRequests &&
+      mergeRequest.state === 'merged';
+    let tempBranchName: string | null = null;
+    let tempBranchCreated = false;
+    const originalSourceBranch = mergeRequest.source_branch;
 
-    // createPullRequest() returns an issue number if a PR could not be created and
-    // an issue was created instead, and settings.useIssueImportAPI is true. In that
-    // case comments were already added and the state is already properly set
-    if (typeof pullRequestData === 'number' || !pullRequestData) return;
+    if (replayMerged) {
+      await this.resetTargetBranchForMergeRequest(mergeRequest, false);
+      const tempBranch = await this.ensureTempBranchForMergeRequest(
+        mergeRequest
+      );
+      if (tempBranch) {
+        tempBranchName = tempBranch.name;
+        tempBranchCreated = tempBranch.created;
+        mergeRequest.source_branch = tempBranchName;
+      }
+    } else if (mergeRequest.source_branch) {
+      // If the source branch no longer exists on GitHub, try a temp branch from GitLab SHA.
+      try {
+        await this.githubApi.repos.getBranch({
+          owner: this.githubOwner,
+          repo: this.githubRepo,
+          branch: mergeRequest.source_branch,
+        });
+      } catch (err) {
+        const status = (err as any).status;
+        if (status === 404) {
+          const tempBranch = await this.ensureTempBranchForMergeRequest(
+            mergeRequest
+          );
+          if (tempBranch) {
+            tempBranchName = tempBranch.name;
+            tempBranchCreated = tempBranch.created;
+            mergeRequest.source_branch = tempBranchName;
+          }
+        } else {
+          throw err;
+        }
+      }
+    }
 
-    let pullRequest = pullRequestData.data;
+    try {
+      let pullRequestData = await this.createPullRequest(mergeRequest);
 
-    // data is set to null if one of the branches does not exist and the pull request cannot be created
-    if (pullRequest) {
-      // Add milestones, labels, and other attributes from the Issues API
-      await this.updatePullRequestData(pullRequest, mergeRequest);
+      // createPullRequest() returns an issue number if a PR could not be created and
+      // an issue was created instead, and settings.useIssueImportAPI is true. In that
+      // case comments were already added and the state is already properly set
+      if (typeof pullRequestData === 'number' || !pullRequestData) return;
 
-      // add any comments/nodes associated with this pull request
-      await this.createPullRequestComments(pullRequest, mergeRequest);
+      let pullRequest = pullRequestData.data;
 
-      // Make sure to close the GitHub pull request if it is closed or merged in GitLab
-      await this.updatePullRequestState(pullRequest, mergeRequest);
+      // data is set to null if one of the branches does not exist and the pull request cannot be created
+      if (pullRequest) {
+        // Add milestones, labels, and other attributes from the Issues API
+        await this.updatePullRequestData(pullRequest, mergeRequest);
+
+        // Request reviewers and add approvals info (best-effort).
+        await this.requestReviewersAndApprovers(pullRequest, mergeRequest);
+
+        // add any comments/nodes associated with this pull request
+        await this.createPullRequestComments(pullRequest, mergeRequest);
+
+        if (replayMerged) {
+          await this.closePullRequestWithGitlabMergeInfo(
+            pullRequest,
+            mergeRequest
+          );
+        } else {
+          // Make sure to close the GitHub pull request if it is closed or merged in GitLab
+          await this.updatePullRequestState(pullRequest, mergeRequest);
+        }
+      }
+    } finally {
+      if (tempBranchName) {
+        mergeRequest.source_branch = originalSourceBranch;
+        if (tempBranchCreated) {
+          await this.deleteTempBranch(tempBranchName, mergeRequest);
+        }
+      }
+    }
+  }
+
+  private convertReviewers(mergeRequest: GitLabMergeRequest): string[] {
+    if (!mergeRequest.reviewers) return [];
+    let reviewers: string[] = [];
+    for (let reviewer of mergeRequest.reviewers) {
+      let username: string = reviewer.username as string;
+      this.users.add(username);
+      if (username === settings.github.username) {
+        reviewers.push(settings.github.username);
+      } else if (settings.usermap && settings.usermap[username]) {
+        let gitHubUsername = settings.usermap[username];
+        if (!this.githubOwnerIsOrg || this.members.has(gitHubUsername)) {
+          reviewers.push(gitHubUsername);
+        } else {
+          console.log(
+            `Cannot request reviewer: User ${gitHubUsername} is not a member of ${this.githubOwner}`
+          );
+        }
+      }
+    }
+
+    return reviewers;
+  }
+
+  private async requestReviewersAndApprovers(
+    pullRequest: Pick<GitHubPullRequest, 'number'>,
+    mergeRequest: GitLabMergeRequest
+  ): Promise<void> {
+    if (settings.dryRun) return;
+
+    const reviewers = this.convertReviewers(mergeRequest);
+    const approvals = await this.gitlabHelper.getMergeRequestApprovals(
+      mergeRequest.iid
+    );
+    const mappedApprovals = approvals
+      .map(u => (settings.usermap && settings.usermap[u] ? settings.usermap[u] : u))
+      .filter(u => u);
+
+    if (reviewers.length > 0) {
+      await utils.sleep(this.delayInMs);
+      await this.githubApi.pulls
+        .requestReviewers({
+          owner: this.githubOwner,
+          repo: this.githubRepo,
+          pull_number: pullRequest.number,
+          reviewers: Array.from(new Set(reviewers)),
+        })
+        .catch(err => {
+          console.error('could not request GitHub reviewers!');
+          console.error(err);
+        });
+    }
+
+    if (mappedApprovals.length > 0) {
+      await utils.sleep(this.delayInMs);
+      const body = utils.organizationUsersString(
+        Array.from(new Set(mappedApprovals)),
+        'Approved by'
+      );
+      await this.githubApi.issues
+        .createComment({
+          owner: this.githubOwner,
+          repo: this.githubRepo,
+          issue_number: pullRequest.number,
+          body: body.trim(),
+        })
+        .catch(err => {
+          console.error('could not create GitHub approvals comment!');
+          console.error(err);
+        });
     }
   }
 
@@ -1123,13 +1256,312 @@ export class GithubHelper {
     }
   }
 
+  private async getMergeRequestBaseSha(
+    mergeRequest: GitLabMergeRequest
+  ): Promise<string | null> {
+    const baseSha = (mergeRequest as any).diff_refs?.base_sha;
+    if (baseSha) return baseSha;
+    if (!mergeRequest.iid) return null;
+
+    const detailed = await this.gitlabHelper.getMergeRequest(mergeRequest.iid);
+    return (detailed as any)?.diff_refs?.base_sha ?? null;
+  }
+
+  private async getMergeRequestHeadSha(
+    mergeRequest: GitLabMergeRequest
+  ): Promise<string | null> {
+    const headSha = (mergeRequest as any).diff_refs?.head_sha ?? mergeRequest.sha;
+    if (headSha) return headSha;
+    if (!mergeRequest.iid) return null;
+
+    const detailed = await this.gitlabHelper.getMergeRequest(mergeRequest.iid);
+    return (detailed as any)?.diff_refs?.head_sha ?? null;
+  }
+
+  private async getMergeRequestMergeCommitSha(
+    mergeRequest: GitLabMergeRequest
+  ): Promise<string | null> {
+    const mergeSha = (mergeRequest as any).merge_commit_sha;
+    if (mergeSha) return mergeSha;
+    if (!mergeRequest.iid) return null;
+
+    const detailed = await this.gitlabHelper.getMergeRequest(mergeRequest.iid);
+    return (detailed as any)?.merge_commit_sha ?? null;
+  }
+
+  private async githubHasCommit(sha: string): Promise<boolean> {
+    try {
+      await this.githubApi.repos.getCommit({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref: sha,
+      });
+      return true;
+    } catch (err) {
+      const status = (err as any).status;
+      if (status === 404 || status === 422) return false;
+      throw err;
+    }
+  }
+
+  private refsWriteDisabled = false;
+  private refsWriteDisabledNotified = false;
+
+  private noteRefsWriteDisabled(): void {
+    if (this.refsWriteDisabledNotified) return;
+    this.refsWriteDisabledNotified = true;
+    console.log(
+      `\tDisabling Git ref updates for this run (received 404/403 from GitHub refs API).`
+    );
+  }
+
+  private async safeUpdateRef(
+    ref: string,
+    sha: string,
+    context: string
+  ): Promise<boolean> {
+    if (this.refsWriteDisabled) {
+      console.log(
+        `\tSkipping ${context}: ref updates are disabled for this run.`
+      );
+      return false;
+    }
+    try {
+      await this.githubApi.git.updateRef({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref,
+        sha,
+        force: true,
+      });
+      return true;
+    } catch (err) {
+      const status = (err as any).status;
+      if (status === 404 || status === 403) {
+        this.refsWriteDisabled = true;
+        this.noteRefsWriteDisabled();
+        console.log(
+          `\tSkipping ${context}: cannot update '${ref}' (${status}).`
+        );
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  private async ensureTempBranchForMergeRequest(
+    mergeRequest: GitLabMergeRequest
+  ): Promise<null | { name: string; created: boolean }> {
+    if (!mergeRequest.iid) return null;
+    const headSha = await this.getMergeRequestHeadSha(mergeRequest);
+    if (!headSha) return null;
+
+    const name = `gl-mr-${mergeRequest.iid}`;
+    let branchSha = headSha;
+    const hasHeadSha = await this.githubHasCommit(headSha);
+    if (!hasHeadSha) {
+      const mergeSha = await this.getMergeRequestMergeCommitSha(mergeRequest);
+      if (mergeSha && (await this.githubHasCommit(mergeSha))) {
+        branchSha = mergeSha;
+        console.log(
+          `\tHead commit ${headSha} for MR !${mergeRequest.iid} is missing on GitHub; using merge commit ${mergeSha} for temp branch '${name}'.`
+        );
+      } else {
+        console.log(
+          `\tSkipping temp branch '${name}' for MR !${mergeRequest.iid}: neither head commit ${headSha} nor merge commit ${mergeSha ?? '<none>'} exists on GitHub.`
+        );
+        return null;
+      }
+    }
+
+    if (this.refsWriteDisabled) {
+      console.log(
+        `\tSkipping temp branch '${name}' for MR !${mergeRequest.iid}: ref updates are disabled for this run.`
+      );
+      return null;
+    }
+    try {
+      await this.githubApi.git.createRef({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref: `refs/heads/${name}`,
+        sha: branchSha,
+      });
+      return { name, created: true };
+    } catch (err) {
+      const status = (err as any).status;
+      const message = (err as any)?.response?.data?.message;
+      if (status === 404 || status === 403) {
+        this.refsWriteDisabled = true;
+        this.noteRefsWriteDisabled();
+        console.log(
+          `\tSkipping temp branch '${name}' for MR !${mergeRequest.iid}: cannot create ref (status ${status}).`
+        );
+        return null;
+      }
+      if (status !== 422 || message !== 'Reference already exists') throw err;
+    }
+
+    await this.safeUpdateRef(`heads/${name}`, branchSha, `temp branch '${name}'`);
+    return { name, created: true };
+  }
+
+  private async deleteTempBranch(
+    branchName: string,
+    mergeRequest: GitLabMergeRequest
+  ): Promise<void> {
+    try {
+      await this.githubApi.git.deleteRef({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        ref: `heads/${branchName}`,
+      });
+    } catch (err) {
+      console.error(
+        `\tFailed to delete temp branch '${branchName}' for MR !${mergeRequest.iid}`
+      );
+      console.error(err);
+    }
+  }
+
+  private async closePullRequestWithGitlabMergeInfo(
+    pullRequest: Pick<GitHubPullRequest, 'number' | 'state'>,
+    mergeRequest: GitLabMergeRequest
+  ): Promise<void> {
+    if (settings.dryRun) return;
+    if (pullRequest.state === 'closed') return;
+
+    const mergeSha = await this.getMergeRequestMergeCommitSha(mergeRequest);
+    const targetBranch = mergeRequest.target_branch;
+
+    if (mergeSha && targetBranch) {
+      if (await this.githubHasCommit(mergeSha)) {
+        await utils.sleep(this.delayInMs);
+        await this.safeUpdateRef(
+          `heads/${targetBranch}`,
+          mergeSha,
+          `merge commit update for MR !${mergeRequest.iid}`
+        );
+      } else {
+        console.log(
+          `\tSkipping '${targetBranch}' update for MR !${mergeRequest.iid}: merge commit ${mergeSha} does not exist on GitHub.`
+        );
+      }
+    }
+
+    await utils.sleep(this.delayInMs);
+    await this.githubApi.issues.update({
+      owner: this.githubOwner,
+      repo: this.githubRepo,
+      issue_number: pullRequest.number,
+      state: 'closed',
+    });
+
+    const mergedBy = (mergeRequest as any).merged_by?.username;
+    const mergedAt = (mergeRequest as any).merged_at;
+    const mappedMerger =
+      mergedBy && settings.usermap && settings.usermap[mergedBy]
+        ? settings.usermap[mergedBy]
+        : mergedBy;
+
+    let info = 'Merged in GitLab.';
+    if (mappedMerger) {
+      info += ` Merged by @${mappedMerger}`;
+    }
+    if (mergedAt) {
+      info += ` on ${mergedAt}.`;
+    }
+    if (mergeSha) {
+      info += ` Merge commit: ${mergeSha}.`;
+    }
+
+    await utils.sleep(this.delayInMs);
+    await this.githubApi.issues.createComment({
+      owner: this.githubOwner,
+      repo: this.githubRepo,
+      issue_number: pullRequest.number,
+      body: info,
+    });
+  }
+
+  private async resetTargetBranchForMergeRequest(
+    mergeRequest: GitLabMergeRequest,
+    restore: boolean
+  ): Promise<null | (() => Promise<void>)> {
+    if (settings.dryRun) return null;
+    const targetBranch = mergeRequest.target_branch;
+    const baseSha = await this.getMergeRequestBaseSha(mergeRequest);
+
+    if (!targetBranch || !baseSha) {
+      console.log(
+        `\tSkipping target branch reset for MR !${mergeRequest.iid} (missing target branch or base sha).`
+      );
+      return null;
+    }
+
+    let currentBranch;
+    try {
+      currentBranch = await this.githubApi.repos.getBranch({
+        owner: this.githubOwner,
+        repo: this.githubRepo,
+        branch: targetBranch,
+      });
+    } catch (err) {
+      const status = (err as any).status;
+      if (status === 404) {
+        console.log(
+          `\tSkipping reset of '${targetBranch}' for MR !${mergeRequest.iid}: target branch does not exist on GitHub.`
+        );
+        return null;
+      }
+      throw err;
+    }
+    const currentSha = currentBranch.data.commit.sha;
+
+    if (currentSha === baseSha) return null;
+
+    if (!(await this.githubHasCommit(baseSha))) {
+      console.log(
+        `\tSkipping reset of '${targetBranch}' for MR !${mergeRequest.iid}: base commit ${baseSha} does not exist on GitHub.`
+      );
+      return null;
+    }
+
+    console.log(
+      `\tResetting '${targetBranch}' to ${baseSha} for MR !${mergeRequest.iid}`
+    );
+    await utils.sleep(this.delayInMs);
+    const resetOk = await this.safeUpdateRef(
+      `heads/${targetBranch}`,
+      baseSha,
+      `reset of '${targetBranch}' for MR !${mergeRequest.iid}`
+    );
+
+    if (!restore || !resetOk) return null;
+
+    return async () => {
+      console.log(
+        `\tRestoring '${targetBranch}' to ${currentSha} after MR !${mergeRequest.iid}`
+      );
+      await utils.sleep(this.delayInMs);
+      await this.safeUpdateRef(
+        `heads/${targetBranch}`,
+        currentSha,
+        `restore of '${targetBranch}' for MR !${mergeRequest.iid}`
+      );
+    };
+  }
+
   // ----------------------------------------------------------------------------
 
   /**
    * Creates the information required for a new review comment.
    * See: https://docs.github.com/en/rest/pulls/comments?apiVersion=2022-11-28#create-a-review-comment-for-a-pull-request
    */
-  static createReviewCommentInformation(position, repoLink: string): object {
+  static createReviewCommentInformation(
+    position,
+    repoLink: string
+  ): object | null {
     if (
       !repoLink ||
       !repoLink.startsWith(gitHubLocation) ||
@@ -1137,7 +1569,7 @@ export class GithubHelper {
       !position.head_sha ||
       !position.line_range
     ) {
-      throw new Error(`Position is invalid: ${JSON.stringify(position)}`);
+      return null;
     }
 
     let head_sha = position.head_sha;
@@ -1243,10 +1675,20 @@ export class GithubHelper {
           }
 
           if (note.type === 'DiffNote') {
-            reviewComments.push({
-              body: await this.convertIssuesAndComments(note.body, note, true, false),
-              ...GithubHelper.createReviewCommentInformation(note.position, repoLink),
-            });
+            const reviewInfo = GithubHelper.createReviewCommentInformation(
+              note.position,
+              repoLink
+            );
+            if (reviewInfo) {
+              reviewComments.push({
+                body: await this.convertIssuesAndComments(note.body, note, true, false),
+                ...reviewInfo,
+              });
+            } else {
+              console.log(
+                '\tSkipping invalid diff position for review comment, falling back to regular comment.'
+              );
+            }
           } 
           
           // create regular comment either way, in case the review comment cannot be created
@@ -1272,16 +1714,17 @@ export class GithubHelper {
               ...first_comment,
             }).catch(x => {
               let use_fallback = false;
-              if (x.status === 422) {
-                if (x.response.data.message === 'Validation Failed') {
-                  let validation_error = x.response.data.errors[0];
-                  if (validation_error.message.endsWith(' is not part of the pull request')) {
-                    // fall back to creating a regular comment for the discussion
-                    create_regular_comment = true;
-                    use_fallback = true;
-                    console.log('fallback to regular comment');
-                  }
-                }
+              if (x.status === 422 || x.status === 404) {
+                // fall back to creating a regular comment for the discussion
+                create_regular_comment = true;
+                use_fallback = true;
+                const message = x.response?.data?.message;
+                const validation_error = x.response?.data?.errors?.[0]?.message;
+                console.log(
+                  `fallback to regular comment (review comment failed: ${message ?? 'unknown'}${
+                    validation_error ? ` - ${validation_error}` : ''
+                  })`
+                );
               }
 
               if (!use_fallback) {
@@ -1456,7 +1899,7 @@ export class GithubHelper {
    * @param add_issue_information Set to true to add assignees, reviewers, and approvers
    */
   async convertIssuesAndComments(
-    str: string,
+    str: string | null | undefined,
     item: GitLabIssue | GitLabMergeRequest | GitLabNote | MilestoneImport | GitLabDiscussionNote,
     add_line: boolean = true,
     add_line_ref: boolean = true,
@@ -1470,11 +1913,18 @@ export class GithubHelper {
     // before the #, and we do the same for MRs, labels and milestones.
 
     const repoLink = `${this.githubUrl}/${this.githubOwner}/${this.githubRepo}`;
+    // Normalize empty/nullable bodies to avoid null.replace crashes.
+    str = str ?? '';
     const hasUsermap =
       settings.usermap !== null && Object.keys(settings.usermap).length > 0;
     const hasProjectmap =
       settings.projectmap !== null &&
       Object.keys(settings.projectmap).length > 0;
+
+    str = str.replace(
+      /\[Compare with previous version\]\([^)]+\)/g,
+      'Compare with previous version (link unavailable after force-push)'
+    );
 
     if (add_line) str = GithubHelper.addMigrationLine(str, item, repoLink, add_line_ref);
     let reString = '';
@@ -1734,7 +2184,7 @@ export class GithubHelper {
       ref = head_sha;
     }
 
-    let lineRef = `Commented on [${ref}](${repoLink}/compare/${base_sha}..${head_sha}${slug})\n\n`;
+    let lineRef = `Commented on [${ref}](${repoLink}/compare/${base_sha}...${head_sha}${slug})\n\n`;
 
     if (position.line_range) {
       if (position.line_range.start.type === 'new') {
